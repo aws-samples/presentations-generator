@@ -1,0 +1,569 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: ppt-generator-backend Sample SAM Template for ppt-generator-backend
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 256
+  Api:
+    Cors:
+      AllowMethods: "'*'"
+      AllowHeaders: "'*'"
+      AllowOrigin: "'*'"
+
+Resources:
+  DataAccessPolicy:
+    Type: "AWS::OpenSearchServerless::AccessPolicy"
+    Properties:
+      Name: !Sub "${AWS::StackName}-data"
+      Type: data
+      Description: Access policy for AOSS collection
+      Policy: !Sub >-
+        [{"Description":"Access for cfn user","Rules":[{"ResourceType":"index","Resource":["index/*/*"],"Permission":["aoss:*"]},
+        {"ResourceType":"collection","Resource":["collection/ppt-generator-opensearch"],"Permission":["aoss:*"]}],
+        "Principal":["${LambdaAOSSIndexRole.Arn}", "${BedrockKnowledgeBaseRole.Arn}"]}]
+
+  NetworkPolicy:
+    Type: "AWS::OpenSearchServerless::SecurityPolicy"
+    Properties:
+      Name: !Sub "${AWS::StackName}-net"
+      Type: network
+      Description: Network policy for AOSS collection
+      Policy: !Sub >-
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/ppt-generator-opensearch"]}, {"ResourceType":"dashboard","Resource":["collection/ppt-generator-opensearch"]}],"AllowFromPublic":true}]
+
+  EncryptionPolicy:
+    Type: "AWS::OpenSearchServerless::SecurityPolicy"
+    Properties:
+      Name: !Sub "${AWS::StackName}-enc"
+      Type: encryption
+      Description: Encryption policy for AOSS collection
+      Policy: !Sub >-
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/ppt-generator-opensearch"]}],"AWSOwnedKey":true}
+
+  OpenSearchCollection:
+    Type: "AWS::OpenSearchServerless::Collection"
+    Properties:
+      Name: ppt-generator-opensearch
+      Type: VECTORSEARCH
+    DependsOn: EncryptionPolicy
+
+  LambdaAOSSIndexRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OpenSearchAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:*
+                Resource: "*"
+
+  AOSSLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaAOSSIndexRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import urllib.error
+          import os
+          import logging
+          from opensearchpy import OpenSearch, RequestsHttpConnection, AWSV4SignerAuth
+          import boto3
+          import botocore
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          session = boto3.session.Session()
+          region = session.region_name
+          client = boto3.client('opensearchserverless')
+          service = 'aoss'
+          credentials = boto3.Session().get_credentials()
+          auth = AWSV4SignerAuth(credentials, region, service)
+          collection_endpoint = os.environ['OPENSEARCH_ENDPOINT']
+          index_name = os.environ['INDEX_NAME']
+
+          def send_response(event, context, response_status, response_data):
+              response_body = json.dumps({
+                  "Status": response_status,
+                  "Reason": f"See the details in CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event['StackId'],
+                  "RequestId": event['RequestId'],
+                  "LogicalResourceId": event['LogicalResourceId'],
+                  "Data": response_data
+              })
+
+              headers = {
+                  "content-type": "",
+                  "content-length": str(len(response_body))
+              }
+
+              request = urllib.request.Request(event['ResponseURL'], data=response_body.encode('utf-8'), headers=headers, method='PUT')
+
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      logger.info("Status code: %s", response.getcode())
+                      logger.info("Response body: %s", response.read().decode('utf-8'))
+              except Exception as e:
+                  logger.error("Failed to send the response: %s", e)
+
+          def handler(event, context):
+              logger.info("Received event: %s", json.dumps(event))
+
+              if event["RequestType"] == "Delete":
+                # Send to CF
+                send_response(event, context, "SUCCESS", {"Message": "Delete stack"})
+              else:
+                try:
+                    # Build the OpenSearch client
+                    final_host = collection_endpoint.replace("https://", "")
+                    client = OpenSearch(
+                        hosts=[{'host': final_host, 'port': 443}],
+                        http_auth=auth,
+                        use_ssl=True,
+                        verify_certs=True,
+                        connection_class=RequestsHttpConnection,
+                        timeout=300
+                    )
+                    
+                    # It can take up to a minute for data access rules to be enforced
+                    time.sleep(45)
+                
+                    # Create index
+                    body_json = {
+                      "settings": {
+                          "index.knn": "true",
+                          "number_of_shards": 1,
+                          "knn.algo_param.ef_search": 512,
+                          "number_of_replicas": 0,
+                      },
+                      "mappings": {
+                          "properties": {
+                            "vector": {
+                                "type": "knn_vector",
+                                "dimension": 1536,
+                                "method": {
+                                    "name": "hnsw",
+                                    "engine": "faiss",
+                                    "space_type": "l2"
+                                },
+                            },
+                            "text": {
+                                "type": "text"
+                            },
+                            "metadata": {
+                                "type": "text"         }
+                          }
+                      }
+                    }
+                    response = client.indices.create(index=index_name, body=json.dumps(body_json))
+                    logger.info('\nCreating index:')
+                    logger.info(response)
+                    logger.info("Successfully created index: %s", index_name)
+                    
+                    # Send to CF
+                    send_response(event, context, "SUCCESS", {"Message": "Index created successfully"})
+                except urllib.error.URLError as e:
+                    logger.error("Failed to create index: %s", e)
+                    
+                    # Send to CF
+                    send_response(event, context, "FAILED", {"Message": "Index creation failed", "Error": str(e)})
+      Runtime: python3.12
+      Timeout: 120
+      Layers:
+        - arn:aws:lambda:us-east-1:770693421928:layer:Klayers-p312-opensearch-py:1
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          INDEX_NAME: bedrock-knowledge-base-default-index
+
+  OpenSearchIndexCreation:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AOSSLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: "apigateway.amazonaws.com"
+
+  OpenSearchIndexCreationCustomResource:
+    Type: Custom::CreateIndex
+    Properties:
+      ServiceToken: !GetAtt AOSSLambdaFunction.Arn
+
+  BedrockKnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+              ArnLike:
+                "AWS:SourceArn": !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*"
+      Path: /
+      Policies:
+        - PolicyName: S3ReadOnlyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-pptgen/*"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-pptgen"
+        - PolicyName: AOSSAPIAccessAll
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*
+        - PolicyName: BedrockListAndInvokeModel
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:ListCustomModels
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+
+  KnowledgeBase:
+    Type: "AWS::Bedrock::KnowledgeBase"
+    DependsOn: OpenSearchIndexCreationCustomResource
+    Properties:
+      Name: ppt-generator-kb
+      RoleArn: !GetAtt BedrockKnowledgeBaseRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v1"
+      StorageConfiguration:
+        Type: "OPENSEARCH_SERVERLESS"
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OpenSearchCollection.Arn
+          VectorIndexName: bedrock-knowledge-base-default-index
+          FieldMapping:
+            VectorField: "vector"
+            TextField: "text"
+            MetadataField: "metadata"
+
+  KBDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBase
+      Name: ppt-generator-data-source
+      DataSourceConfiguration:
+        Type: "S3"
+        S3Configuration:
+          BucketArn: !Sub "arn:aws:s3:::${AWS::StackName}-${AWS::AccountId}-pptgen"
+
+  S3BucketPresentationGenerator:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-${AWS::AccountId}-pptgen"
+      AccelerateConfiguration:
+        AccelerationStatus: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins:
+              - "*"
+            Id: CORSRule
+            MaxAge: 3600
+
+  DynamoDBTablepptpresentations:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-dynamodb-presentations
+      AttributeDefinitions:
+        - AttributeType: S
+          AttributeName: session_id
+      KeySchema:
+        - KeyType: HASH
+          AttributeName: session_id
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  StepFunctionsStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      DefinitionUri: order.asl.json
+      DefinitionSubstitutions:
+        InvokeLLMArn: !GetAtt InvokeLLM.Arn
+        InvokeImageGenerationArn: !GetAtt InvokeImageGeneration.Arn
+        InvokePPTGenerationArn: !GetAtt InvokePPTGeneration.Arn
+      Name: !Sub ${AWS::StackName}-PPT-Generator-Step-Function
+      Role: !GetAtt IAMStepFunctionRole.Arn
+      Events:
+        GetPPTAPIEvent:
+          Type: Api
+          Properties:
+            Path: /gen-ppt
+            Method: post
+
+  InvokeLLM:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/invoke_llm/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaExecute
+        - AmazonBedrockFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTablepptpresentations
+        - S3CrudPolicy:
+            BucketName: !Sub "${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-pptgen"
+      Environment:
+        Variables:
+          kb_id: !Ref KnowledgeBase
+          table_name: !Ref DynamoDBTablepptpresentations
+
+  InvokeImageGeneration:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/invoke_image_generator/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaExecute
+        - AmazonBedrockFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTablepptpresentations
+        - S3CrudPolicy:
+            BucketName: !Sub "${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-pptgen"
+      Environment:
+        Variables:
+          bucket_name: !Ref S3BucketPresentationGenerator
+          table_name: !Ref DynamoDBTablepptpresentations
+
+  InvokePPTGeneration:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaExecute
+        - AmazonBedrockFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTablepptpresentations
+        - S3FullAccessPolicy:
+            BucketName: !Sub "${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-pptgen"
+        - !Ref IAMPresentationGeneratorPolicy
+      Environment:
+        Variables:
+          table_name: !Ref DynamoDBTablepptpresentations
+          bucket_name: !Ref S3BucketPresentationGenerator
+          path: "generated_images"
+          template_key: "templates/ppt-template.pptx"
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: src/invoke_ppt_generation
+      DockerTag: python3.12
+
+  DownloadPresentation:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/download/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaExecute
+        - AmazonBedrockFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTablepptpresentations
+        - S3CrudPolicy:
+            BucketName: !Sub "${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-pptgen"
+      Environment:
+        Variables:
+          bucket_name: !Ref S3BucketPresentationGenerator
+      Events:
+        S3PresignedUrl:
+          Type: Api
+          Properties:
+            Path: /download
+            Method: get
+
+  GetDynamoDB:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/get_dynamodb/
+      Handler: app.lambda_handler
+      Runtime: python3.12
+      Architectures:
+        - x86_64
+      Policies:
+        - AWSLambdaExecute
+        - AmazonBedrockFullAccess
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DynamoDBTablepptpresentations
+        - S3CrudPolicy:
+            BucketName: !Sub "${AWS::AccountId}-${AWS::Region}-${AWS::StackName}-pptgen"
+      Environment:
+        Variables:
+          table_name: !Ref DynamoDBTablepptpresentations
+      Events:
+        ListPPTs:
+          Type: Api
+          Properties:
+            Path: /get-data
+            Method: get
+
+  IAMPresentationGeneratorPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "Presentation-generator-policy"
+      Path: "/"
+      Description: ""
+      Groups: []
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Resource: !Join
+              - ""
+              - - "arn:aws:dynamodb:"
+                - !Ref "AWS::Region"
+                - ":"
+                - !Ref "AWS::AccountId"
+                - ":table/"
+                - !Ref DynamoDBTablepptpresentations
+            Action:
+              - "dynamodb:GetItem"
+              - "dynamodb:PutItem"
+              - "dynamodb:DeleteItem"
+              - "dynamodb:Scan"
+              - "dynamodb:Query"
+              - "dynamodb:UpdateItem"
+            Effect: "Allow"
+          - Resource: "*"
+            Action:
+              - "bedrock:InvokeModel"
+              - "bedrock:Retrieve"
+              - "bedrock:RetrieveAndGenerate"
+            Effect: "Allow"
+          - Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref S3BucketPresentationGenerator
+            Action:
+              - "s3:*"
+            Effect: "Allow"
+          - Resource: "*"
+            Action:
+              - "lambda:InvokeFunction"
+            Effect: "Allow"
+
+  IAMStepFunctionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Ref IAMPresentationGeneratorPolicy
+      MaxSessionDuration: 3600
+      RoleName: "IAMStepFunctionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action: "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "states.amazonaws.com"
+                - "lambda.amazonaws.com"
+
+  IAMStepFunctionPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: "Step-function-policy"
+      Path: "/"
+      Description: ""
+      Groups: []
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Resource: !Join
+              - ""
+              - - "arn:aws:dynamodb:"
+                - !Ref "AWS::Region"
+                - ":"
+                - !Ref "AWS::AccountId"
+                - ":table/"
+                - !Ref DynamoDBTablepptpresentations
+            Action:
+              - "dynamodb:GetItem"
+              - "dynamodb:PutItem"
+              - "dynamodb:DeleteItem"
+              - "dynamodb:Scan"
+              - "dynamodb:Query"
+              - "dynamodb:UpdateItem"
+            Effect: "Allow"
+          - Resource: "*"
+            Action:
+              - "bedrock:InvokeModel"
+              - "bedrock:Retrieve"
+              - "bedrock:RetrieveAndGenerate"
+            Effect: "Allow"
+          - Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref S3BucketPresentationGenerator
+            Action:
+              - "s3:*"
+            Effect: "Allow"
+          - Resource: "*"
+            Action:
+              - "lambda:InvokeFunction"
+            Effect: "Allow"
+      Roles:
+        - !Ref IAMStepFunctionRole
+
+Outputs:
+  ExamsBucket:
+    Description: S3 bucket name
+    Value: !Ref S3BucketPresentationGenerator
+  PresentationGeneratorApi:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"

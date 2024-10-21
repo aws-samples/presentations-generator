@@ -1,0 +1,60 @@
+{
+    "Comment": "A description of my state machine",
+    "StartAt": "Invoke_LLM",
+    "States": {
+      "Invoke_LLM": {
+        "Type": "Task",
+        "Resource": "${InvokeLLMArn}",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 1,
+            "MaxAttempts": 3,
+            "BackoffRate": 2
+          }
+        ],
+        "Next": "Image_Generation"
+      },
+      "Image_Generation": {
+        "Type": "Task",
+        "Resource": "${InvokeImageGenerationArn}",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 1,
+            "MaxAttempts": 3,
+            "BackoffRate": 2
+          }
+        ],
+        "Next": "Invoke PPT Generation"
+      },
+      "Invoke PPT Generation": {
+        "Type": "Task",
+        "Resource": "${InvokePPTGenerationArn}",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 1,
+            "MaxAttempts": 3,
+            "BackoffRate": 2
+          }
+        ],
+        "End": true
+      }
+    }
+  }
